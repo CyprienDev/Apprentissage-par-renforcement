@@ -1,451 +1,384 @@
-from __future__ import annotations
-from collections import deque
-from math import atan2, cos, sin, pi, hypot, sqrt, tanh
 import json
+from collections import deque
+from math import cos, sin, pi
 from pathlib import Path
-from random import Random
-from rl_arena.arena_api import (Action, Movement, Rotation, ObjectKind, EventKind,
-    SoundKind, Ingest, Pickup, Manipulate, Equip, Use, Shoot, Drop, EpisodeEndReason)
+
+import numpy as np
+from rl_arena.arena_api import (
+    Action, Movement, Rotation, Pickup, Drop, Equip, Use, Ingest,
+    Manipulate, Shoot, ObjectKind, EpisodeEndReason, EventKind,
+)
 
 MODEL_PATH = Path(__file__).with_name('artifacts') / 'policy.json'
-STRATEGIES = ('explore', 'forage', 'flee', 'rest', 'scan')
-BLOCKERS = {ObjectKind.WALL, ObjectKind.OBSTACLE, ObjectKind.MOVING_OBSTACLE,
-            ObjectKind.HAZARD}
-RESOURCES = {ObjectKind.FOOD, ObjectKind.DRINK, ObjectKind.MEDICINE}
+KINDS = tuple(ObjectKind)
+ACTION_TYPES = (
+    'idle', 'move', 'rotate', 'rest', 'pickup', 'drop',
+    'equip', 'use', 'ingest', 'manipulate', 'shoot',
+)
+
+STATE_FEATURE_COUNT = 13 + 4 * len(KINDS)
+ACTION_FEATURE_COUNT = len(ACTION_TYPES) + 5 + len(KINDS) + 8
+FEATURE_COUNT = STATE_FEATURE_COUNT + ACTION_FEATURE_COUNT
+HIDDEN_NEURONS = 32
+MEMORY_SIZE = 2048
+BATCH_SIZE = 16
+TRAIN_EVERY = 4
+TARGET_SYNC_EVERY = 200
+LEARNING_RATE = .0005
 
 
-def wrap(angle):
-    return (angle + pi) % (2*pi) - pi
+def state_representation(observation):
+    agent_state = observation.self_state
+    bleeding = sum(injury.bleeding for injury in agent_state.injuries)
+    collision = any(event.kind is EventKind.COLLISION for event in observation.events)
+    damage = 0.
+    for event in observation.events:
+        if event.kind is EventKind.DAMAGE_RECEIVED:
+            damage += event.value or 0.
+    sound_intensity = sum(sound.intensity for sound in observation.hearing)
 
+    features = [
+        agent_state.health,
+        agent_state.energy,
+        agent_state.hydration,
+        agent_state.satiety,
+        min(1., agent_state.carried_mass / 20),
+        min(1., abs(agent_state.speed) / 3),
+        len(agent_state.inventory) / 8,
+        min(1., bleeding),
+        float(bool(observation.touch)),
+        float(collision),
+        min(1., damage),
+        min(1., sound_intensity),
+        float(agent_state.equipped_slot is not None),
+    ]
 
-def dangerous_damage(obs):
-    depleted = min(obs.self_state.hydration,obs.self_state.satiety) < .2
-    bleeding = any(i.bleeding > 0 for i in obs.self_state.injuries)
-    return any(e.kind is EventKind.DAMAGE_RECEIVED and
-               (e.value is None or e.value > .01 or not (depleted or bleeding))
-               for e in obs.events)
+    for kind in KINDS:
+        visible_objects = []
+        for detection in observation.vision:
+            if detection.kind is kind:
+                visible_objects.append(detection)
 
+        if visible_objects:
+            nearest = min(visible_objects, key=lambda detection: detection.distance)
+            proximity = 1 / (1 + max(0., nearest.distance))
+            features.extend([
+                proximity,
+                proximity * cos(nearest.bearing),
+                proximity * sin(nearest.bearing),
+            ])
+        else:
+            features.extend([0., 0., 0.])
 
-def visible_threats(obs):
-    return [d for d in obs.vision if
-            (d.kind is ObjectKind.AGENT and d.distance < 6) or
-            (d.kind is ObjectKind.PROJECTILE and d.distance < 10)]
+    for kind in KINDS:
+        quantity = sum(item.kind is kind for item in agent_state.inventory)
+        features.append(quantity / 8)
 
-
-def state_representation(obs):
-    s = obs.self_state
-    enemy = min((d.distance for d in obs.vision if d.kind in
-                 {ObjectKind.AGENT, ObjectKind.PROJECTILE}), default=99)
-    return (int(s.health < .5), int(s.energy < .18), int(s.energy < .4),
-            int(s.hydration < .65), int(s.satiety < .65),
-            0 if enemy > 6 else 1 if enemy > 3 else 2,
-            int(any(d.kind in RESOURCES for d in obs.vision)),
-            int(bool(obs.touch)), int(dangerous_damage(obs)))
+    return np.asarray(features, dtype=np.float32)
 
 
 class MyAgent:
-    def __init__(self, model_path=MODEL_PATH, seed=0, load=True, adaptive=True,
-                 replay_steps=4, epsilon=.025):
-        self.rng = Random(seed)
-        self.learning_rng = Random(seed+991)
+    def __init__(self, model_path=MODEL_PATH, seed=0, load=True, adaptive=False,
+                 replay_steps=1, epsilon=None):
+        self.rng = np.random.default_rng(seed)
+        self.replay_rng = np.random.default_rng(seed + 991)
         self.adaptive = adaptive
+        if epsilon is None:
+            self.epsilon = .10 if adaptive else 0.
+        else:
+            self.epsilon = epsilon
         self.replay_steps = replay_steps
-        self.epsilon = epsilon
-        self.q, self.episodes, self.updates = {}, 0, 0
-        if load and Path(model_path).exists():
-            data = json.loads(Path(model_path).read_text(encoding='utf-8'))
-            if data.get('version') in {1,2}:
+        self.gamma = .99
+        self.episodes = 0
+        self.updates = 0
 
-                data = {'version': 3, 'strategies': list(STRATEGIES), 'q': {}, 'episodes': 0}
-            if data.get('version') != 3 or data.get('strategies') != list(STRATEGIES):
-                raise ValueError('Modèle incompatible')
-            self.q = {tuple(map(int, k.split(','))): list(v) for k,v in data['q'].items()}
-            if any(len(k) != 9 or len(v) != 5 or any(not isinstance(x, (float,int))
-                   or not (-1e9 < x < 1e9) for x in v) for k,v in self.q.items()):
-                raise ValueError('Dimensions ou valeurs Q invalides')
-            self.episodes = data.get('episodes', 0)
+        input_weights = self.rng.normal(0, .08, (FEATURE_COUNT, HIDDEN_NEURONS))
+        input_bias = np.zeros(HIDDEN_NEURONS, dtype=np.float32)
+        output_weights = self.rng.normal(0, .08, (HIDDEN_NEURONS, 1))
+        output_bias = np.zeros(1, dtype=np.float32)
+        self.weights = [
+            input_weights.astype(np.float32), input_bias,
+            output_weights.astype(np.float32), output_bias,
+        ]
+
+        if load and Path(model_path).exists():
+            self._load(model_path)
+
+        self.target = [weights.copy() for weights in self.weights]
+        self.moments = [np.zeros_like(weights) for weights in self.weights]
+        self.variances = [np.zeros_like(weights) for weights in self.weights]
+        self.replay = deque(maxlen=MEMORY_SIZE)
         self.reset()
 
     def reset(self):
-
-        self.position = [0., 0.]
-        self.visits = {}
-        self.resources = []
-        self.replay = deque(maxlen=256)
         self.previous = None
-        self.last_action = None
-        self.last_tick = None
-        self.last_strategy = None
-        self.threat_until = -1
-        self.threat_heading = None
-        self.turn_sign = self.rng.choice((-1, 1))
-        self.heading = self.rng.uniform(-pi, pi)
-        self.stuck_ticks = 0
-        self.detour_until = -1
-        self.door_cooldowns = {}
-        self.visited_doors = []
-        self.enter_until = -1
-        self.entry_heading = None
+        self.last_tick = -1
+        self.last_action = Action()
         self.online_transitions = 0
         self.last_reward = 0.
-        self.energy_cost = .003
-        self.rest_gain = .025
-        self.dynamics_samples = 0
-        self.ignored_loot_until = {}
-        self.recovering = False
         self._ended = False
 
-    def prior(self, state):
-        _, low, medium, thirsty, hungry, threat, resource, contact, damage = state
-        return [1., 2.5 if resource else .8,
-            4. if threat or damage else -3., 3. if low else 1.5 if medium else -4., .7]
+    def set_training_enabled(self, enabled, epsilon=.10):
+        self.adaptive = bool(enabled)
+        self.epsilon = epsilon if enabled else 0.
+        self.previous = None
+        if not enabled:
+            self.replay.clear()
 
-    def values(self, state):
-        return self.q.get(state,self.prior(state))
+    def _load(self, path):
+        data = json.loads(Path(path).read_text(encoding='utf-8'))
+        if data.get('version') != 4 or data.get('actions') != list(ACTION_TYPES):
+            raise ValueError('Checkpoint incompatible : entraîner le nouvel agent RL version 4')
 
-    def _state(self, obs):
-        state = list(state_representation(obs))
-        state[6] = int(any(self._want_resource(r[0],obs.self_state) for r in self.resources)
-                       or any(self._wanted_detection(d,obs.self_state) for d in obs.vision))
-        if obs.tick < self.threat_until:
-            state[5] = max(1,state[5])
-        return tuple(state)
+        loaded_weights = []
+        for values in data['weights']:
+            loaded_weights.append(np.asarray(values, dtype=np.float32))
+        if len(loaded_weights) != len(self.weights):
+            raise ValueError('Poids de modèle invalides')
+        for loaded, expected in zip(loaded_weights, self.weights):
+            if loaded.shape != expected.shape or not np.isfinite(loaded).all():
+                raise ValueError('Poids de modèle invalides')
 
-    def _want_resource(self, kind, s):
-        if kind not in RESOURCES:
-            return False
-        count = sum(i.kind is kind for i in s.inventory)
-        limit = 3 if kind is ObjectKind.DRINK else 2 if kind is ObjectKind.FOOD else 1
-        if count >= limit or len(s.inventory) >= 7:
-            return False
+        self.weights = loaded_weights
+        self.episodes = int(data.get('episodes', 0))
 
+    def candidates(self, observation):
+        actions = [
+            (Action(), 'idle', None),
+            (Action(rest=True), 'rest', None),
+        ]
+        directions = np.arange(8) * pi / 4
+        for angle in directions:
+            for speed in (1., 2.5):
+                movement = Movement(cos(angle), sin(angle), speed)
+                actions.append((Action(movement=movement), 'move', None))
+        for angular_speed in (-pi / 2, pi / 2):
+            rotation = Rotation(angular_speed)
+            actions.append((Action(rotation=rotation), 'rotate', None))
 
-        return kind is not ObjectKind.MEDICINE or s.health < .85 or bool(s.injuries)
+        for detection in observation.vision:
+            pickup = Action(interaction=Pickup(detection.ref))
+            manipulate = Action(interaction=Manipulate(detection.ref))
+            actions.append((pickup, 'pickup', detection))
+            actions.append((manipulate, 'manipulate', detection))
 
-    def _wanted_detection(self, d, s):
-        if not self._want_resource(d.kind,s):
-            return False
-        bandage = d.properties.get('medical_type',d.properties.get('label')) == 'bandage'
-        return not bandage or any(i.bleeding > .05 for i in s.injuries)
+        for item in observation.self_state.inventory:
+            interactions = [
+                ('drop', Drop(item.slot)),
+                ('equip', Equip(item.slot)),
+                ('use', Use(item.slot)),
+                ('ingest', Ingest(item.slot)),
+            ]
+            for name, interaction in interactions:
+                actions.append((Action(interaction=interaction), name, item))
+            for detection in observation.vision:
+                interaction = Use(item.slot, detection.ref)
+                actions.append((Action(interaction=interaction), 'use', detection))
 
-    def choose(self, obs, epsilon=None):
-        state = self._state(obs)
-        s = obs.self_state
-        available = [0, 4]
-        wanted_memory = any(self._want_resource(r[0],s) for r in self.resources)
-        if state[6]:
-            available.append(1)
-        if obs.tick < self.threat_until or state[5] or state[8]:
-            available.append(2)
-        if s.energy < .4 and obs.tick >= self.threat_until:
-            available.append(3)
+        for bearing in directions:
+            shoot = Shoot(float(bearing))
+            actions.append((Action(interaction=shoot), 'shoot', None))
+        return actions
 
-        if (s.hydration < .6 or s.satiety < .6) and wanted_memory and not state[5]:
-            return 1
-        epsilon = self.epsilon if epsilon is None else epsilon
-        if self.rng.random() < epsilon and not state[5]:
-            return self.rng.choice(available)
-        values = self.values(state)
-        prior = self.prior(state)
-        best = max(values[i] for i in available)
+    def features(self, observation, candidates):
+        state = state_representation(observation)
+        rows = []
+        for action, name, target in candidates:
+            action_type = [0.] * len(ACTION_TYPES)
+            action_type[ACTION_TYPES.index(name)] = 1.
 
+            movement_features = [0.] * 5
+            if action.movement is not None:
+                movement = action.movement
+                movement_features[:3] = [
+                    movement.forward, movement.right, movement.speed / 3,
+                ]
+            if action.rotation is not None:
+                movement_features[3] = action.rotation.angular_speed / pi
+            if isinstance(action.interaction, Shoot):
+                bearing = action.interaction.bearing
+                movement_features[:2] = [cos(bearing), sin(bearing)]
+            movement_features[4] = float(action.rest)
 
-        return max(available,key=lambda i:prior[i]+.5*tanh((values[i]-best)/2))
+            target_kind = [0.] * len(KINDS)
+            target_properties = [0.] * 8
+            if target is not None:
+                target_kind[KINDS.index(target.kind)] = 1.
+                if hasattr(target, 'distance'):
+                    target_properties[:4] = [
+                        1 / (1 + max(0., target.distance)),
+                        cos(target.bearing),
+                        sin(target.bearing),
+                        min(1., target.angular_size / pi),
+                    ]
+                else:
+                    target_properties[4] = min(1., target.mass / 10)
+                target_properties[5] = float(target.properties.get('open', False))
+                target_properties[6] = float(target.properties.get('medical_type') == 'bandage')
+                target_properties[7] = float(target.properties.get('label') == 'potato_launcher')
 
-    def learn(self, state, action, reward, next_state, terminal, alpha=.2, gamma=.97):
-        values = self.q.setdefault(state, list(self.values(state)))
-        if terminal:
-            target = reward
-        else:
-            eligible = [0,4]
-            if next_state[6]:
-                eligible.append(1)
-            if next_state[5] or next_state[8]:
-                eligible.append(2)
-            if next_state[1] or next_state[2]:
-                eligible.append(3)
-            future = self.values(next_state)
-            target = reward + gamma * max(future[i] for i in eligible)
-        values[action] += alpha * (target - values[action])
-        self.updates += 1
+            row = list(state) + action_type + movement_features + target_kind + target_properties
+            rows.append(row)
+        return np.asarray(rows, dtype=np.float32).reshape(-1, FEATURE_COUNT)
 
-    def _feedback(self, obs, novelty):
-        if self.previous is None:
-            return
-        old, state, strategy = self.previous
-        s, before = obs.self_state, old.self_state
-        collisions = sum(e.kind is EventKind.COLLISION for e in obs.events)
-        if self.adaptive and self.last_action is not None:
-            movement = self.last_action.movement
-            if movement and s.speed > .5 and not collisions and before.energy > .2:
-                cost = max(0.,before.energy-s.energy)/s.speed**2
-                if 0 < cost < .1:
-                    self.energy_cost = .7*self.energy_cost + .3*cost
-                    self.dynamics_samples += 1
-            if self.last_action.rest and s.energy < .99:
-                gain = s.energy-before.energy
-                if gain > 0:
-                    self.rest_gain = .7*self.rest_gain + .3*gain
-        reward = (.025 + 20 * max(0, s.hydration-before.hydration)
-                  + 12 * max(0, s.satiety-before.satiety)
-                  + 8 * (s.health-before.health)
-                  + .25 * (s.energy-before.energy)
-                  + .08 * novelty - .3 * min(2, collisions))
-        reward += .3 * sum(e.kind is EventKind.ITEM_PICKED_UP for e in obs.events)
-        if self.stuck_ticks > 3:
-            reward -= .15
-        self.last_reward = reward
+    def values(self, features, target=False):
+        network = self.target if target else self.weights
+        input_weights, input_bias, output_weights, output_bias = network
+        hidden_layer = np.tanh(features @ input_weights + input_bias)
+        q_values = hidden_layer @ output_weights + output_bias
+        return q_values.ravel()
+
+    def choose(self, features, epsilon=None):
+        exploration = 0.
         if self.adaptive:
-            transition = (state, strategy, reward, self._state(obs), False)
-            self.learn(*transition)
-            self.replay.append(transition)
+            exploration = self.epsilon if epsilon is None else epsilon
+        if self.rng.random() < exploration:
+            return int(self.rng.integers(len(features)))
+
+        q_values = self.values(features)
+        highest_value = q_values.max()
+        best_actions = np.flatnonzero(np.isclose(q_values, highest_value, rtol=0, atol=1e-7))
+        return int(self.rng.choice(best_actions))
+
+    def reward(self, previous, current):
+        before = previous.self_state
+        after = current.self_state
+        elapsed_ticks = max(1, current.tick - previous.tick)
+        collisions = sum(event.kind is EventKind.COLLISION for event in current.events)
+
+        survival_reward = .025 * elapsed_ticks
+        health_reward = 10 * (after.health - before.health)
+        hydration_reward = 3 * (after.hydration - before.hydration)
+        food_reward = 2 * (after.satiety - before.satiety)
+        energy_reward = .1 * (after.energy - before.energy)
+        collision_penalty = .05 * collisions
+
+        return (survival_reward + health_reward + hydration_reward
+                + food_reward + energy_reward - collision_penalty)
+
+    def remember(self, features, reward, next_features, terminal=False):
+        if not self.adaptive:
+            return
+        experience = (features.copy(), float(reward), next_features.copy(), terminal)
+        self.replay.append(experience)
+        self.online_transitions += 1
+
+        training_due = self.online_transitions % TRAIN_EVERY == 0
+        if terminal or training_due:
             for _ in range(self.replay_steps):
-                self.learn(*self.learning_rng.choice(self.replay), alpha=.08)
-            self.online_transitions += 1
+                self.learn()
 
-    def _travel_speed(self, obs):
-        if not self.adaptive or self.dynamics_samples < 8:
-            return 1.7
+    def _training_targets(self, batch):
+        expected_values = np.asarray([experience[1] for experience in batch], dtype=np.float32)
+        next_states = []
+        batch_positions = []
+        for position, experience in enumerate(batch):
+            _, _, next_features, terminal = experience
+            if not terminal:
+                next_states.append(next_features)
+                batch_positions.append(position)
 
+        if not next_states:
+            return expected_values
 
-        speed = max(1.2,min(2.7,sqrt(self.rest_gain/max(.0001,self.energy_cost))))
-        if any(d.kind in BLOCKERS and d.distance < 2 for d in obs.vision):
-            speed = min(speed,1.5)
-        return speed
+        all_next_features = np.concatenate(next_states)
+        online_values = self.values(all_next_features)
+        target_values = self.values(all_next_features, target=True)
+        offset = 0
+        for position, next_features in zip(batch_positions, next_states):
+            action_count = len(next_features)
+            action_values = online_values[offset:offset + action_count]
+            best_action = int(np.argmax(action_values))
+            future_value = target_values[offset + best_action]
+            expected_values[position] += self.gamma * future_value
+            offset += action_count
+        return expected_values
 
-    def _observe(self, obs):
-        if self.last_tick is not None and obs.tick < self.last_tick:
-            self.reset()
-        if self.previous is not None and self.last_action and self.last_action.movement:
-            movement = self.last_action.movement
-            collision = any(e.kind is EventKind.COLLISION for e in obs.events)
-            travelled = obs.self_state.speed * .5 * (0.15 if collision else 1.)
-            angle = obs.self_state.orientation + atan2(movement.right, movement.forward)
-            self.position[0] += cos(angle) * travelled
-            self.position[1] += sin(angle) * travelled
-            self.stuck_ticks = self.stuck_ticks+1 if collision or travelled < .08 else 0
-        cell = (round(self.position[0]/2), round(self.position[1]/2))
-        novelty = cell not in self.visits
-        self.visits[cell] = self.visits.get(cell, 0) + 1
-        if len(self.visits) > 2048:
-            self.visits.pop(next(iter(self.visits)))
-        s = obs.self_state
-        self.resources = [r for r in self.resources if obs.tick-r[3] < 120 and
-                          hypot(r[1]-self.position[0], r[2]-self.position[1]) > .65]
-        for d in obs.vision:
-            if d.kind not in RESOURCES:
-                continue
-            angle = s.orientation + d.bearing
-            x = self.position[0] + (d.distance+.2)*cos(angle)
-            y = self.position[1] + (d.distance+.2)*sin(angle)
-            self.resources = [r for r in self.resources if r[0] != d.kind or hypot(r[1]-x,r[2]-y) > 1.5]
-            self.resources.append((d.kind,x,y,obs.tick))
-        self.resources = self.resources[-32:]
-        self._feedback(obs, novelty)
-        enemies = visible_threats(obs)
-        if enemies:
-            d = min(enemies, key=lambda d:d.distance)
-            self.threat_until = obs.tick+10
-            self.threat_heading = wrap(s.orientation + d.bearing + pi)
-        elif dangerous_damage(obs):
-            self.threat_until = obs.tick+8
-            sounds = sorted(obs.hearing, key=lambda x:x.intensity, reverse=True)
-            if sounds:
-                self.threat_heading = wrap(s.orientation+sounds[0].bearing+pi)
-        if self.stuck_ticks >= 3:
-            if obs.tick >= self.detour_until:
-                self.turn_sign *= -1
-            self.detour_until = obs.tick+12
-        self.last_tick = obs.tick
+    def _gradients(self, inputs, expected_values):
+        input_weights, input_bias, output_weights, output_bias = self.weights
+        hidden_layer = np.tanh(inputs @ input_weights + input_bias)
+        predictions = (hidden_layer @ output_weights + output_bias).ravel()
+
+        errors = np.clip(predictions - expected_values, -1., 1.)
+        output_gradient = (errors / len(inputs))[:, None]
+        activation_derivative = 1 - hidden_layer * hidden_layer
+        hidden_gradient = (output_gradient @ output_weights.T) * activation_derivative
+
+        input_weight_gradient = inputs.T @ hidden_gradient
+        input_bias_gradient = hidden_gradient.sum(axis=0)
+        output_weight_gradient = hidden_layer.T @ output_gradient
+        output_bias_gradient = output_gradient.sum(axis=0)
+        return [
+            input_weight_gradient, input_bias_gradient,
+            output_weight_gradient, output_bias_gradient,
+        ]
+
+    def _update_weights(self, gradients):
+        self.updates += 1
+        for index, gradient in enumerate(gradients):
+            self.moments[index] = .9 * self.moments[index] + .1 * gradient
+            self.variances[index] = .999 * self.variances[index] + .001 * gradient * gradient
+            corrected_moment = self.moments[index] / (1 - .9 ** self.updates)
+            corrected_variance = self.variances[index] / (1 - .999 ** self.updates)
+            adjustment = LEARNING_RATE * corrected_moment / (np.sqrt(corrected_variance) + 1e-8)
+            self.weights[index] -= adjustment
+
+    def learn(self, batch=None):
+        if not self.adaptive:
+            return
+        if batch is None:
+            sample_count = min(BATCH_SIZE, len(self.replay))
+            if sample_count == 0:
+                return
+            indices = self.replay_rng.choice(len(self.replay), sample_count, replace=False)
+            batch = [self.replay[int(index)] for index in indices]
+
+        inputs = np.stack([experience[0] for experience in batch])
+        expected_values = self._training_targets(batch)
+        gradients = self._gradients(inputs, expected_values)
+        self._update_weights(gradients)
+
+        if self.updates % TARGET_SYNC_EVERY == 0:
+            self.target = [weights.copy() for weights in self.weights]
 
     def act(self, observation):
-
-        if self.last_tick == observation.tick and self.last_action is not None:
+        if observation.tick == self.last_tick:
             return self.last_action
-        self._observe(observation)
-        strategy = self.choose(observation)
-        action = self.action_for(observation, strategy)
-        self.last_action = action
-        self.previous = (observation, self._state(observation), self.last_strategy)
-        return action
+        if observation.tick < self.last_tick:
+            self.reset()
 
-    def _resource_score(self, kind, s):
-        if kind is ObjectKind.DRINK:
-            return .35 + 2*(1-s.hydration)
-        if kind is ObjectKind.FOOD:
-            return .2 + 1.5*(1-s.satiety)
-        return .1 + 1.5*(1-s.health) + sum(i.bleeding for i in s.injuries)
+        possible_actions = self.candidates(observation)
+        action_features = self.features(observation, possible_actions)
+        if self.previous is not None:
+            previous_observation, previous_features = self.previous
+            self.last_reward = self.reward(previous_observation, observation)
+            self.remember(previous_features, self.last_reward, action_features)
 
-    def _navigate(self, obs, desired, speed, fleeing=False, entering=False):
-
-
-        blockers = [d for d in obs.vision if d.kind in BLOCKERS or
-                    (d.kind is ObjectKind.DOOR and not entering and not d.properties.get('open', False))]
-        blockers.extend(d for d in obs.touch if d.kind in BLOCKERS)
-        candidates = [wrap(desired + offset) for offset in (0,.35,-.35,.7,-.7,1.1,-1.1,1.6,-1.6,2.2,-2.2,pi)]
-        def score(angle):
-            value = 2.5*cos(angle-desired)
-            for d in blockers:
-                distance = getattr(d,'distance',0.)
-                if distance > 3:
-                    continue
-                separation = abs(wrap(angle-d.bearing))
-
-
-                angular = 0 if d.kind is ObjectKind.WALL else min(.3,getattr(d,'angular_size',.6)/2)
-                margin = angular + atan2(.6,max(.2,distance))
-                if separation < margin:
-                    value -= (8 if distance < 1.2 else 3) * (1-separation/max(.01,margin))
-            direction = obs.self_state.orientation+angle
-            cell = (round((self.position[0]+2*cos(direction))/2),
-                    round((self.position[1]+2*sin(direction))/2))
-            value -= min(2., .02*self.visits.get(cell,0))
-            if obs.tick < self.detour_until:
-                value += .8*self.turn_sign*sin(angle)
-            return value
-        angle = max(candidates, key=score)
-        if fleeing:
-            return Action(movement=Movement(cos(angle),sin(angle),speed))
-        rotation = max(-pi,min(pi,2*angle))
-        relative = angle-rotation*.5
-        return Action(Movement(cos(relative),sin(relative),speed),Rotation(rotation))
-
-    def action_for(self, obs, strategy):
-        s = obs.self_state
-        self.last_strategy = strategy
-        for item in s.inventory:
-            bleeding = any(i.bleeding > .05 for i in s.injuries)
-            bandage = item.properties.get('medical_type',item.properties.get('label')) == 'bandage'
-            if ((item.kind is ObjectKind.DRINK and s.hydration < .6) or
-                (item.kind is ObjectKind.FOOD and s.satiety < .65) or
-                (item.kind is ObjectKind.MEDICINE and (bleeding or s.health < .85 and not bandage))):
-                return Action(interaction=Ingest(item.slot))
-        enemies = visible_threats(obs)
-        threatened = bool(enemies) or obs.tick < self.threat_until
-        if threatened:
-            self.last_strategy = strategy = 2
-        else:
-            if s.energy < .2:
-                self.recovering = True
-            elif s.energy >= .75:
-                self.recovering = False
-        if self.recovering and not threatened:
-            self.last_strategy = strategy = 3
-        urgent = {ObjectKind.DRINK:s.hydration < .6,ObjectKind.FOOD:s.satiety < .55,
-                  ObjectKind.MEDICINE:s.health < .5}
-        if len(s.inventory) >= 7 and not threatened and any(
-                urgent.get(d.kind,False) and d.distance < 1.5 for d in obs.vision):
-            dispensable = [i for i in s.inventory if i.kind in {ObjectKind.AMMUNITION,
-                ObjectKind.RAW_MATERIAL,ObjectKind.WEAPON_MODIFIER} or
-                (i.kind is ObjectKind.MEDICINE and s.health > .85 and not s.injuries)]
-            if dispensable:
-                item = dispensable[0]
-                self.ignored_loot_until[item.kind] = obs.tick+100
-                return Action(interaction=Drop(item.slot))
-
-        for d in sorted(obs.vision, key=lambda d:d.distance):
-            if d.distance > .9 or len(s.inventory) >= 7:
-                continue
-            if obs.tick < self.ignored_loot_until.get(d.kind,-1):
-                continue
-            counts = sum(i.kind is d.kind for i in s.inventory)
-            needed = self._want_resource(d.kind,s)
-            needed |= d.kind is ObjectKind.MEDICINE and counts == 0
-            needed |= d.kind is ObjectKind.WEAPON and counts == 0
-            needed |= d.kind is ObjectKind.AMMUNITION and counts < 2 and any(i.kind is ObjectKind.WEAPON for i in s.inventory)
-            if needed and (not threatened or d.kind is ObjectKind.MEDICINE and s.health < .4):
-                return Action(interaction=Pickup(d.ref))
-        doors = [d for d in (*obs.vision,*obs.touch) if d.kind is ObjectKind.DOOR and
-                 getattr(d,'distance',0) < 1.2 and not d.properties.get('open',False)]
-        if doors and not threatened:
-            d = doors[0]
-            key = round(wrap(s.orientation+d.bearing),1)
-            if obs.tick >= self.door_cooldowns.get(key,-1):
-                self.door_cooldowns[key] = obs.tick+6
-                self.entry_heading = wrap(s.orientation+d.bearing)
-                self.enter_until = obs.tick+6
-                self.visited_doors.append((self.position[0]+getattr(d,'distance',0)*cos(self.entry_heading),
-                                           self.position[1]+getattr(d,'distance',0)*sin(self.entry_heading),obs.tick))
-                return Action(interaction=Manipulate(d.ref))
-        if strategy == 3 and not threatened and (s.energy < .4 or self.recovering):
-            return Action(rest=True)
-        if strategy == 2 and threatened:
-            if enemies:
-                d = min(enemies,key=lambda d:d.distance)
-                desired = wrap(d.bearing+pi)
-            else:
-                desired = wrap((self.threat_heading or self.heading)-s.orientation)
-            action = self._navigate(obs,desired,2.7 if s.energy > .2 else 1.7,True)
-
-            equipped = next((i for i in s.inventory if i.slot == s.equipped_slot),None)
-            agents = [d for d in enemies if d.kind is ObjectKind.AGENT]
-            if equipped and agents:
-                target = min(agents,key=lambda d:d.distance)
-                label = equipped.properties.get('weapon_type',equipped.properties.get('label'))
-                interaction = None
-                if label == 'rolling_pin' and target.distance < 1.05:
-                    interaction = Use(equipped.slot,target.ref)
-                elif label == 'potato_launcher' and target.distance < 7 and any(i.kind is ObjectKind.AMMUNITION for i in s.inventory):
-                    interaction = Shoot(target.bearing)
-                if interaction:
-                    return Action(action.movement,interaction=interaction)
-            return action
-        weapon = next((i for i in s.inventory if i.kind is ObjectKind.WEAPON),None)
-        if weapon and s.equipped_slot != weapon.slot:
-            return Action(interaction=Equip(weapon.slot))
-        if obs.tick < self.enter_until and self.entry_heading is not None:
-            return self._navigate(obs,wrap(self.entry_heading-s.orientation),.85,entering=True)
-        if strategy == 1:
-            targets = [(d.kind,d.distance,d.bearing) for d in obs.vision if self._wanted_detection(d,s)]
-            if not targets:
-                targets = [(kind,hypot(x-self.position[0],y-self.position[1]),
-                            wrap(atan2(y-self.position[1],x-self.position[0])-s.orientation))
-                           for kind,x,y,_ in self.resources if self._want_resource(kind,s)]
-            if targets:
-                target = min(targets,key=lambda t:t[1]/self._resource_score(t[0],s))
-                return self._navigate(obs,target[2],min(self._travel_speed(obs),max(.35,(target[1]-.65)*2)))
-        self.visited_doors = [p for p in self.visited_doors if obs.tick-p[2] < 400][-32:]
-
-
-        passages = []
-        for d in obs.vision:
-            if d.kind is not ObjectKind.DOOR or d.distance > 7:
-                continue
-            angle = s.orientation+d.bearing
-            x,y = self.position[0]+d.distance*cos(angle),self.position[1]+d.distance*sin(angle)
-            if not any(hypot(x-p[0],y-p[1]) < 2 for p in self.visited_doors):
-                passages.append(d)
-        if passages:
-            d = min(passages,key=lambda d:d.distance)
-            if d.properties.get('open',False) and d.distance < 1.2:
-                self.entry_heading = wrap(s.orientation+d.bearing)
-                self.enter_until = obs.tick+6
-                self.visited_doors.append((self.position[0]+d.distance*cos(self.entry_heading),
-                                           self.position[1]+d.distance*sin(self.entry_heading),obs.tick))
-            return self._navigate(obs,d.bearing,min(1.4,max(.5,d.distance)),entering=True)
-
-        if obs.tick % 35 == 0 or self.stuck_ticks >= 3:
-            self.heading = wrap(s.orientation+self.turn_sign*self.rng.uniform(.5,1.7))
-        desired = wrap(self.heading-s.orientation)
-        if strategy == 4:
-            desired = wrap(desired+self.turn_sign*.65)
-        return self._navigate(obs,desired,self._travel_speed(obs) if strategy != 4 else 1.2)
+        chosen_index = self.choose(action_features)
+        self.last_action = possible_actions[chosen_index][0]
+        self.previous = (observation, action_features[chosen_index].copy())
+        self.last_tick = observation.tick
+        return self.last_action
 
     def on_episode_end(self, result):
         if self._ended:
             return
         self._ended = True
-        if self.adaptive and self.previous is not None:
-            _,state,strategy = self.previous
-            terminal = result.reason is EpisodeEndReason.ELIMINATED
-            self.learn(state,strategy,-12. if terminal else .025,None,True)
+        if self.previous is not None:
+            terminal_reward = -10. if result.reason is EpisodeEndReason.ELIMINATED else 0.
+            no_next_actions = np.empty((0, FEATURE_COUNT), dtype=np.float32)
+            self.remember(self.previous[1], terminal_reward, no_next_actions, terminal=True)
         self.episodes += 1
 
     def save(self, path=MODEL_PATH):
         path = Path(path)
-        path.parent.mkdir(parents=True,exist_ok=True)
-        data = {'version':3,'strategies':list(STRATEGIES),'episodes':self.episodes,
-                'q':{','.join(map(str,k)):v for k,v in self.q.items()}}
-        temporary = path.with_suffix('.tmp')
-        temporary.write_text(json.dumps(data,indent=2),encoding='utf-8')
-        temporary.replace(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            'version': 4,
+            'actions': list(ACTION_TYPES),
+            'episodes': self.episodes,
+            'weights': [weights.tolist() for weights in self.weights],
+        }
+        temporary_path = path.with_suffix('.tmp')
+        temporary_path.write_text(json.dumps(data, allow_nan=False), encoding='utf-8')
+        temporary_path.replace(path)
