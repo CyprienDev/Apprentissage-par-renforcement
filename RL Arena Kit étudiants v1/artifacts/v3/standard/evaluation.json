@@ -1,0 +1,36 @@
+{
+  "seed": 160000,
+  "episodes": 12,
+  "ticks": 3000,
+  "scenario": "standard",
+  "results": {
+    "cold_adaptive": {
+      "mean_ticks": 2119.0833333333335,
+      "median_ticks": 1750.0,
+      "min_ticks": 1603,
+      "max_ticks": 3000,
+      "mean_pickups": 3,
+      "reached_limit": 0,
+      "act_mean_ms": 0.05394547976715941
+    },
+    "v2_cold": {
+      "mean_ticks": 2224,
+      "median_ticks": 2100.0,
+      "min_ticks": 1603,
+      "max_ticks": 3000,
+      "mean_pickups": 4.583333333333333,
+      "reached_limit": 2,
+      "act_mean_ms": 0.04689416556514034
+    },
+    "v2": {
+      "mean_ticks": 2224,
+      "median_ticks": 2100.0,
+      "min_ticks": 1603,
+      "max_ticks": 3000,
+      "mean_pickups": 4.583333333333333,
+      "reached_limit": 2,
+      "act_mean_ms": 0.046050589918032465
+    }
+  },
+  "paired_vs_adaptive": {}
+}

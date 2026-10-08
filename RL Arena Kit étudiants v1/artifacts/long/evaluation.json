@@ -1,0 +1,31 @@
+{
+  "seed": 95000,
+  "episodes": 5,
+  "ticks": 2000,
+  "results": {
+    "learned": {
+      "mean_ticks": 1856.6,
+      "median_ticks": 1783,
+      "min_ticks": 1750,
+      "max_ticks": 2000
+    },
+    "prior": {
+      "mean_ticks": 1856.6,
+      "median_ticks": 1783,
+      "min_ticks": 1750,
+      "max_ticks": 2000
+    },
+    "random": {
+      "mean_ticks": 1800,
+      "median_ticks": 1750,
+      "min_ticks": 1750,
+      "max_ticks": 2000
+    },
+    "hunter": {
+      "mean_ticks": 1756.6,
+      "median_ticks": 1750,
+      "min_ticks": 1750,
+      "max_ticks": 1783
+    }
+  }
+}

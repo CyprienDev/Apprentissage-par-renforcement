@@ -1,0 +1,79 @@
+{
+  "seed": 130000,
+  "episodes": 8,
+  "ticks": 3000,
+  "scenario": "stress",
+  "results": {
+    "adaptive": {
+      "mean_ticks": 1192.375,
+      "median_ticks": 1114.5,
+      "min_ticks": 815,
+      "max_ticks": 1954,
+      "mean_pickups": 4.125,
+      "reached_limit": 0,
+      "act_mean_ms": 0.04293827920223337
+    },
+    "frozen": {
+      "mean_ticks": 1240,
+      "median_ticks": 1282.0,
+      "min_ticks": 815,
+      "max_ticks": 1621,
+      "mean_pickups": 5.125,
+      "reached_limit": 0,
+      "act_mean_ms": 0.03549082072652718
+    },
+    "v1": {
+      "mean_ticks": 1331,
+      "median_ticks": 1298.5,
+      "min_ticks": 848,
+      "max_ticks": 2000,
+      "mean_pickups": 4.5,
+      "reached_limit": 0,
+      "act_mean_ms": 0.008629454407691653
+    },
+    "random": {
+      "mean_ticks": 941,
+      "median_ticks": 959.5,
+      "min_ticks": 606,
+      "max_ticks": 1186,
+      "mean_pickups": 2.75,
+      "reached_limit": 0,
+      "act_mean_ms": 0.003528957367116797
+    },
+    "hunter": {
+      "mean_ticks": 669.25,
+      "median_ticks": 624.0,
+      "min_ticks": 308,
+      "max_ticks": 1053,
+      "mean_pickups": 0.5,
+      "reached_limit": 0,
+      "act_mean_ms": 0.0030889205894258152
+    }
+  },
+  "paired_vs_adaptive": {
+    "frozen": {
+      "mean_gain_ticks": -47.625,
+      "wins": 1,
+      "ties": 5,
+      "losses": 2
+    },
+    "v1": {
+      "mean_gain_ticks": -138.625,
+      "wins": 2,
+      "ties": 1,
+      "losses": 5
+    },
+    "random": {
+      "mean_gain_ticks": 251.375,
+      "wins": 4,
+      "ties": 4,
+      "losses": 0
+    },
+    "hunter": {
+      "mean_gain_ticks": 523.125,
+      "wins": 8,
+      "ties": 0,
+      "losses": 0
+    }
+  }
+}

@@ -1,0 +1,16 @@
+arcade==3.3.3
+attrs==26.1.0
+cffi==2.1.1
+cloudpickle==3.1.2
+joblib==1.6.0
+narwhals==2.26.0
+numpy==2.5.3
+pillow==11.3.0
+pycparser==3.0
+pyglet==2.1.16
+pymunk==6.9.0
+pytiled_parser==2.2.9
+scikit-learn==1.9.1
+scipy==1.18.1
+threadpoolctl==3.7.0
+typing_extensions==4.16.0

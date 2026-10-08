@@ -1,0 +1,27 @@
+{
+  "seed": 140000,
+  "episodes": 8,
+  "ticks": 3000,
+  "scenario": "stress",
+  "results": {
+    "cold_adaptive": {
+      "mean_ticks": 1858.25,
+      "median_ticks": 1729.0,
+      "min_ticks": 738,
+      "max_ticks": 3000,
+      "mean_pickups": 8.75,
+      "reached_limit": 1,
+      "act_mean_ms": 0.06135328272168888
+    },
+    "v2_cold": {
+      "mean_ticks": 1668,
+      "median_ticks": 1658.0,
+      "min_ticks": 1116,
+      "max_ticks": 2659,
+      "mean_pickups": 8.25,
+      "reached_limit": 0,
+      "act_mean_ms": 0.044606682641559474
+    }
+  },
+  "paired_vs_adaptive": {}
+}

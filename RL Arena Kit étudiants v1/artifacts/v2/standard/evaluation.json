@@ -1,0 +1,109 @@
+{
+  "seed": 120000,
+  "episodes": 12,
+  "ticks": 3000,
+  "scenario": "standard",
+  "results": {
+    "adaptive": {
+      "mean_ticks": 2499.9166666666665,
+      "median_ticks": 2450.0,
+      "min_ticks": 1750,
+      "max_ticks": 3000,
+      "mean_pickups": 6.166666666666667,
+      "reached_limit": 4,
+      "act_mean_ms": 0.04100782734954443
+    },
+    "frozen": {
+      "mean_ticks": 2367.9166666666665,
+      "median_ticks": 2471.0,
+      "min_ticks": 124,
+      "max_ticks": 3000,
+      "mean_pickups": 6.833333333333333,
+      "reached_limit": 4,
+      "act_mean_ms": 0.03320112373500136
+    },
+    "cold_adaptive": {
+      "mean_ticks": 2499.9166666666665,
+      "median_ticks": 2450.0,
+      "min_ticks": 1750,
+      "max_ticks": 3000,
+      "mean_pickups": 6.166666666666667,
+      "reached_limit": 4,
+      "act_mean_ms": 0.045634361092002494
+    },
+    "cold_frozen": {
+      "mean_ticks": 2367.9166666666665,
+      "median_ticks": 2471.0,
+      "min_ticks": 124,
+      "max_ticks": 3000,
+      "mean_pickups": 6.833333333333333,
+      "reached_limit": 4,
+      "act_mean_ms": 0.033319424518024325
+    },
+    "v1": {
+      "mean_ticks": 1898.5833333333333,
+      "median_ticks": 1750.0,
+      "min_ticks": 1750,
+      "max_ticks": 2334,
+      "mean_pickups": 0.6666666666666666,
+      "reached_limit": 0,
+      "act_mean_ms": 0.007610206949234403
+    },
+    "random": {
+      "mean_ticks": 1895,
+      "median_ticks": 1750.0,
+      "min_ticks": 1741,
+      "max_ticks": 2333,
+      "mean_pickups": 2.0833333333333335,
+      "reached_limit": 0,
+      "act_mean_ms": 0.002996854647544513
+    },
+    "hunter": {
+      "mean_ticks": 1752.75,
+      "median_ticks": 1750.0,
+      "min_ticks": 1750,
+      "max_ticks": 1783,
+      "mean_pickups": 0.4166666666666667,
+      "reached_limit": 0,
+      "act_mean_ms": 0.002897199707572861
+    }
+  },
+  "paired_vs_adaptive": {
+    "frozen": {
+      "mean_gain_ticks": 132,
+      "wins": 5,
+      "ties": 4,
+      "losses": 3
+    },
+    "cold_adaptive": {
+      "mean_gain_ticks": 0,
+      "wins": 0,
+      "ties": 12,
+      "losses": 0
+    },
+    "cold_frozen": {
+      "mean_gain_ticks": 132,
+      "wins": 5,
+      "ties": 4,
+      "losses": 3
+    },
+    "v1": {
+      "mean_gain_ticks": 601.3333333333334,
+      "wins": 11,
+      "ties": 1,
+      "losses": 0
+    },
+    "random": {
+      "mean_gain_ticks": 604.9166666666666,
+      "wins": 11,
+      "ties": 1,
+      "losses": 0
+    },
+    "hunter": {
+      "mean_gain_ticks": 747.1666666666666,
+      "wins": 11,
+      "ties": 1,
+      "losses": 0
+    }
+  }
+}

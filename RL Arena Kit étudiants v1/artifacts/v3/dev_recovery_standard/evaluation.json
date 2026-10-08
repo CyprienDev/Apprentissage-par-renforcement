@@ -1,0 +1,27 @@
+{
+  "seed": 150000,
+  "episodes": 8,
+  "ticks": 3000,
+  "scenario": "standard",
+  "results": {
+    "cold_adaptive": {
+      "mean_ticks": 2518.5,
+      "median_ticks": 2417.0,
+      "min_ticks": 1750,
+      "max_ticks": 3000,
+      "mean_pickups": 6,
+      "reached_limit": 1,
+      "act_mean_ms": 0.052850111839666675
+    },
+    "v2_cold": {
+      "mean_ticks": 2558.25,
+      "median_ticks": 2450.0,
+      "min_ticks": 2333,
+      "max_ticks": 3000,
+      "mean_pickups": 6.25,
+      "reached_limit": 2,
+      "act_mean_ms": 0.05026901572070888
+    }
+  },
+  "paired_vs_adaptive": {}
+}
