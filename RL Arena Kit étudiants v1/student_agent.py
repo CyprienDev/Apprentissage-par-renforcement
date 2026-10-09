@@ -1,362 +1,224 @@
 import json
-from collections import deque
-from math import cos, sin, pi
+import random
+from math import cos, sin, pi, floor
 from pathlib import Path
 
-import numpy as np
 from rl_arena.arena_api import (
     Action, Movement, Rotation, Pickup, Drop, Equip, Use, Ingest,
     Manipulate, Shoot, ObjectKind, EpisodeEndReason, EventKind,
 )
 
 MODEL_PATH = Path(__file__).with_name('artifacts') / 'policy.json'
-KINDS = tuple(ObjectKind)
-ACTION_TYPES = (
-    'idle', 'move', 'rotate', 'rest', 'pickup', 'drop',
-    'equip', 'use', 'ingest', 'manipulate', 'shoot',
-)
+MODEL_VERSION = 'q_learning_v1'
+ACTION_TYPES = ('idle', 'rest', 'move', 'rotate', 'pickup', 'manipulate',
+                'shoot', 'drop', 'equip', 'use', 'ingest')
 
-STATE_FEATURE_COUNT = 13 + 4 * len(KINDS)
-ACTION_FEATURE_COUNT = len(ACTION_TYPES) + 5 + len(KINDS) + 8
-FEATURE_COUNT = STATE_FEATURE_COUNT + ACTION_FEATURE_COUNT
-HIDDEN_NEURONS = 32
-MEMORY_SIZE = 2048
-BATCH_SIZE = 16
-TRAIN_EVERY = 4
-TARGET_SYNC_EVERY = 200
-LEARNING_RATE = .0005
+
+def level(value, thresholds):
+    # Compte les seuils dépassés : une mesure continue devient une catégorie.
+    return sum(value >= threshold for threshold in thresholds)
+
+
+def item_name(item):
+    # Distingue les deux armes et les soins sans utiliser le numéro du slot.
+    subtype = item.properties.get('weapon_type') or item.properties.get('medical_type') or ''
+    return f'{item.kind.name}:{subtype}'
 
 
 def state_representation(observation):
-    agent_state = observation.self_state
-    bleeding = sum(injury.bleeding for injury in agent_state.injuries)
+    # Un état discret représente les besoins et la menace visible, pas une carte.
+    state = observation.self_state
+    enemies = [d.distance for d in observation.vision if d.kind is ObjectKind.AGENT]
+    # 0 signifie aucun adversaire visible ; les autres nombres indiquent sa proximité.
+    threat = 0 if not enemies else 1 + level(min(enemies), (1.5, 5.))
+    inventory = {item.kind for item in state.inventory}
+    # Chaque bit indique la présence d'une catégorie utile dans l'inventaire.
+    kinds = (ObjectKind.FOOD, ObjectKind.DRINK, ObjectKind.MEDICINE,
+             ObjectKind.WEAPON, ObjectKind.AMMUNITION)
+    inventory_mask = sum(1 << index for index, kind in enumerate(kinds) if kind in inventory)
+    equipped = next((item for item in state.inventory if item.slot == state.equipped_slot), None)
+    weapon = item_name(equipped) if equipped is not None else 'none'
     collision = any(event.kind is EventKind.COLLISION for event in observation.events)
-    damage = 0.
-    for event in observation.events:
-        if event.kind is EventKind.DAMAGE_RECEIVED:
-            damage += event.value or 0.
-    sound_intensity = sum(sound.intensity for sound in observation.hearing)
-
-    features = [
-        agent_state.health,
-        agent_state.energy,
-        agent_state.hydration,
-        agent_state.satiety,
-        min(1., agent_state.carried_mass / 20),
-        min(1., abs(agent_state.speed) / 3),
-        len(agent_state.inventory) / 8,
-        min(1., bleeding),
-        float(bool(observation.touch)),
-        float(collision),
-        min(1., damage),
-        min(1., sound_intensity),
-        float(agent_state.equipped_slot is not None),
-    ]
-
-    for kind in KINDS:
-        visible_objects = []
-        for detection in observation.vision:
-            if detection.kind is kind:
-                visible_objects.append(detection)
-
-        if visible_objects:
-            nearest = min(visible_objects, key=lambda detection: detection.distance)
-            proximity = 1 / (1 + max(0., nearest.distance))
-            features.extend([
-                proximity,
-                proximity * cos(nearest.bearing),
-                proximity * sin(nearest.bearing),
-            ])
-        else:
-            features.extend([0., 0., 0.])
-
-    for kind in KINDS:
-        quantity = sum(item.kind is kind for item in agent_state.inventory)
-        features.append(quantity / 8)
-
-    return np.asarray(features, dtype=np.float32)
+    # Des catégories grossières permettent de réutiliser un état dans plusieurs arènes.
+    values = (level(state.health, (.5,)), level(state.energy, (.25, .6)),
+              level(state.hydration, (.35,)), level(state.satiety, (.35,)),
+              threat, inventory_mask, weapon, int(collision))
+    return '|'.join(map(str, values))
 
 
 class MyAgent:
     def __init__(self, model_path=MODEL_PATH, seed=0, load=True, adaptive=False,
-                 replay_steps=1, epsilon=None):
-        self.rng = np.random.default_rng(seed)
-        self.replay_rng = np.random.default_rng(seed + 991)
-        self.adaptive = adaptive
-        if epsilon is None:
-            self.epsilon = .10 if adaptive else 0.
-        else:
-            self.epsilon = epsilon
-        self.replay_steps = replay_steps
-        self.gamma = .99
+                 epsilon=None, temperature=None):
+        self.rng = random.Random(seed)  # Rend les tirages reproductibles.
+        self.adaptive = bool(adaptive)  # False par défaut : pas d'apprentissage en tournoi.
+        self.epsilon = (.2 if adaptive else 0.) if epsilon is None else float(epsilon)
+        self.temperature = 0. if temperature is None else float(temperature)
+        self.alpha = .15  # Part de la nouvelle estimation dans une mise à jour.
+        self.gamma = .98  # Importance des récompenses futures.
+        self.q_table = {}  # Structure : état -> action -> valeur Q apprise.
         self.episodes = 0
         self.updates = 0
-
-        input_weights = self.rng.normal(0, .08, (FEATURE_COUNT, HIDDEN_NEURONS))
-        input_bias = np.zeros(HIDDEN_NEURONS, dtype=np.float32)
-        output_weights = self.rng.normal(0, .08, (HIDDEN_NEURONS, 1))
-        output_bias = np.zeros(1, dtype=np.float32)
-        self.weights = [
-            input_weights.astype(np.float32), input_bias,
-            output_weights.astype(np.float32), output_bias,
-        ]
-
-        if load and Path(model_path).exists():
-            self._load(model_path)
-
-        self.target = [weights.copy() for weights in self.weights]
-        self.moments = [np.zeros_like(weights) for weights in self.weights]
-        self.variances = [np.zeros_like(weights) for weights in self.weights]
-        self.replay = deque(maxlen=MEMORY_SIZE)
+        if load and Path(model_path).is_file():
+            self._load(model_path)  # Charge une table Q ; les anciens réseaux sont incompatibles.
+        if temperature is not None:
+            self.temperature = float(temperature)
+        if not 0 <= self.temperature < float('inf'):
+            raise ValueError('La température doit être finie et positive ou nulle')
         self.reset()
 
     def reset(self):
+        # Efface la mémoire d'une partie, mais conserve la table Q et le mode tournoi.
         self.previous = None
         self.last_tick = -1
         self.last_action = Action()
-        self.online_transitions = 0
         self.last_reward = 0.
+        self.online_transitions = 0
         self._ended = False
+        self.position = [0., 0.]
+        self.visits = {(0, 0): 1}
+        self.exploration_reward = 0.
 
-    def set_training_enabled(self, enabled, epsilon=.10):
+    def set_training_enabled(self, enabled, epsilon=.2):
         self.adaptive = bool(enabled)
-        self.epsilon = epsilon if enabled else 0.
-        self.previous = None
-        if not enabled:
-            self.replay.clear()
-
-    def _load(self, path):
-        data = json.loads(Path(path).read_text(encoding='utf-8'))
-        if data.get('version') != 4 or data.get('actions') != list(ACTION_TYPES):
-            raise ValueError('Checkpoint incompatible : entraîner le nouvel agent RL version 4')
-
-        loaded_weights = []
-        for values in data['weights']:
-            loaded_weights.append(np.asarray(values, dtype=np.float32))
-        if len(loaded_weights) != len(self.weights):
-            raise ValueError('Poids de modèle invalides')
-        for loaded, expected in zip(loaded_weights, self.weights):
-            if loaded.shape != expected.shape or not np.isfinite(loaded).all():
-                raise ValueError('Poids de modèle invalides')
-
-        self.weights = loaded_weights
-        self.episodes = int(data.get('episodes', 0))
+        self.epsilon = float(epsilon) if enabled else 0.
+        self.previous = None  # Évite de réutiliser une transition de la phase précédente.
 
     def candidates(self, observation):
-        actions = [
-            (Action(), 'idle', None),
-            (Action(rest=True), 'rest', None),
-        ]
-        directions = np.arange(8) * pi / 4
-        for angle in directions:
-            for speed in (1., 2.5):
-                movement = Movement(cos(angle), sin(angle), speed)
-                actions.append((Action(movement=movement), 'move', None))
-        for angular_speed in (-pi / 2, pi / 2):
-            rotation = Rotation(angular_speed)
-            actions.append((Action(rotation=rotation), 'rotate', None))
+        # Construire les possibilités n'impose aucun choix : choose consulte la table Q.
+        actions = {'idle': Action(), 'rest': Action(rest=True)}
+        for direction in range(8):
+            angle = direction * pi / 4
+            for speed in (1., 3.2):
+                move = Movement(cos(angle), sin(angle), speed)
+                actions[f'move:direction:{direction}:{speed}'] = Action(movement=move)
+        for sign in (-1, 1):
+            actions[f'rotate:{sign}'] = Action(rotation=Rotation(sign * pi / 2))
+        for direction in range(8):
+            actions[f'shoot:direction:{direction}'] = Action(interaction=Shoot(direction * pi / 4))
 
+        # Une cible par catégorie : la plus proche. Le traitement est identique pour toutes.
+        nearest = {}
         for detection in observation.vision:
-            pickup = Action(interaction=Pickup(detection.ref))
-            manipulate = Action(interaction=Manipulate(detection.ref))
-            actions.append((pickup, 'pickup', detection))
-            actions.append((manipulate, 'manipulate', detection))
+            if detection.kind not in nearest or detection.distance < nearest[detection.kind].distance:
+                nearest[detection.kind] = detection
+        for kind, target in nearest.items():
+            # Le numéro de référence reste dans l'Action, jamais dans la clé apprise.
+            distance = level(target.distance, (.45, 1.5, 5.))
+            label = f'{kind.name}:{distance}'
+            for offset in (0, 1, 2, 3):
+                angle = target.bearing + offset * pi / 2
+                for speed in (1., 3.2):
+                    move = Movement(cos(angle), sin(angle), speed)
+                    actions[f'move:target:{label}:{offset}:{speed}'] = Action(movement=move)
+            actions[f'pickup:{label}'] = Action(interaction=Pickup(target.ref))
+            actions[f'manipulate:{label}'] = Action(interaction=Manipulate(target.ref))
+            actions[f'shoot:target:{label}'] = Action(interaction=Shoot(target.bearing))
+
+        # L'audition fournit aussi des directions possibles, même hors du champ de vision.
+        if observation.hearing:
+            sound = max(observation.hearing, key=lambda sound: sound.intensity)
+            intensity = level(sound.intensity, (.2, .6))
+            for offset in (0, 1, 2, 3):
+                angle = sound.bearing + offset * pi / 2
+                move = Movement(cos(angle), sin(angle), 3.2)
+                actions[f'move:sound:{sound.kind.name}:{intensity}:{offset}'] = Action(movement=move)
 
         for item in observation.self_state.inventory:
-            interactions = [
-                ('drop', Drop(item.slot)),
-                ('equip', Equip(item.slot)),
-                ('use', Use(item.slot)),
-                ('ingest', Ingest(item.slot)),
-            ]
-            for name, interaction in interactions:
-                actions.append((Action(interaction=interaction), name, item))
-            for detection in observation.vision:
-                interaction = Use(item.slot, detection.ref)
-                actions.append((Action(interaction=interaction), 'use', detection))
-
-        for bearing in directions:
-            shoot = Shoot(float(bearing))
-            actions.append((Action(interaction=shoot), 'shoot', None))
+            name = item_name(item)
+            # setdefault garde un exemplaire si plusieurs objets ont le même rôle.
+            for verb, interaction in (('drop', Drop(item.slot)), ('equip', Equip(item.slot)),
+                                      ('use', Use(item.slot)), ('ingest', Ingest(item.slot))):
+                actions.setdefault(f'{verb}:item:{name}', Action(interaction=interaction))
+            for kind, target in nearest.items():
+                distance = level(target.distance, (.45, 1.5, 5.))
+                key = f'use:target:{name}:{kind.name}:{distance}'
+                interaction = Use(item.slot, target.ref)
+                actions.setdefault(key, Action(interaction=interaction))
+                move = Movement(cos(target.bearing), sin(target.bearing), 3.2)
+                actions.setdefault(key + ':move', Action(movement=move, interaction=interaction))
         return actions
 
-    def features(self, observation, candidates):
-        state = state_representation(observation)
-        rows = []
-        for action, name, target in candidates:
-            action_type = [0.] * len(ACTION_TYPES)
-            action_type[ACTION_TYPES.index(name)] = 1.
+    def choose(self, state, actions):
+        keys = list(actions)
+        if self.adaptive and self.rng.random() < self.epsilon:
+            # Exploration équilibrée : tirer d'abord un type, puis une action de ce type.
+            types = sorted({key.split(':')[0] for key in keys})
+            selected = self.rng.choice(types)
+            return self.rng.choice([key for key in keys if key.split(':')[0] == selected])
+        values = self.q_table.get(state, {})  # La lecture n'ajoute rien en tournoi.
+        best = max(values.get(key, 0.) for key in keys)
+        if self.temperature > 0:
+            from math import exp
+            weights = [exp((values.get(key, 0.) - best) / self.temperature) for key in keys]
+            return self.rng.choices(keys, weights=weights, k=1)[0]
+        # Les actions inconnues valent zéro ; les égalités sont départagées au hasard.
+        return self.rng.choice([key for key in keys if abs(values.get(key, 0.) - best) <= 1e-9])
 
-            movement_features = [0.] * 5
-            if action.movement is not None:
-                movement = action.movement
-                movement_features[:3] = [
-                    movement.forward, movement.right, movement.speed / 3,
-                ]
-            if action.rotation is not None:
-                movement_features[3] = action.rotation.angular_speed / pi
-            if isinstance(action.interaction, Shoot):
-                bearing = action.interaction.bearing
-                movement_features[:2] = [cos(bearing), sin(bearing)]
-            movement_features[4] = float(action.rest)
-
-            target_kind = [0.] * len(KINDS)
-            target_properties = [0.] * 8
-            if target is not None:
-                target_kind[KINDS.index(target.kind)] = 1.
-                if hasattr(target, 'distance'):
-                    target_properties[:4] = [
-                        1 / (1 + max(0., target.distance)),
-                        cos(target.bearing),
-                        sin(target.bearing),
-                        min(1., target.angular_size / pi),
-                    ]
-                else:
-                    target_properties[4] = min(1., target.mass / 10)
-                target_properties[5] = float(target.properties.get('open', False))
-                target_properties[6] = float(target.properties.get('medical_type') == 'bandage')
-                target_properties[7] = float(target.properties.get('label') == 'potato_launcher')
-
-            row = list(state) + action_type + movement_features + target_kind + target_properties
-            rows.append(row)
-        return np.asarray(rows, dtype=np.float32).reshape(-1, FEATURE_COUNT)
-
-    def values(self, features, target=False):
-        network = self.target if target else self.weights
-        input_weights, input_bias, output_weights, output_bias = network
-        hidden_layer = np.tanh(features @ input_weights + input_bias)
-        q_values = hidden_layer @ output_weights + output_bias
-        return q_values.ravel()
-
-    def choose(self, features, epsilon=None):
-        exploration = 0.
-        if self.adaptive:
-            exploration = self.epsilon if epsilon is None else epsilon
-        if self.rng.random() < exploration:
-            return int(self.rng.integers(len(features)))
-
-        q_values = self.values(features)
-        highest_value = q_values.max()
-        best_actions = np.flatnonzero(np.isclose(q_values, highest_value, rtol=0, atol=1e-7))
-        return int(self.rng.choice(best_actions))
-
-    def reward(self, previous, current):
-        before = previous.self_state
-        after = current.self_state
-        elapsed_ticks = max(1, current.tick - previous.tick)
-        collisions = sum(event.kind is EventKind.COLLISION for event in current.events)
-
-        survival_reward = .025 * elapsed_ticks
-        health_reward = 10 * (after.health - before.health)
-        hydration_reward = 3 * (after.hydration - before.hydration)
-        food_reward = 2 * (after.satiety - before.satiety)
-        energy_reward = .1 * (after.energy - before.energy)
-        collision_penalty = .05 * collisions
-
-        return (survival_reward + health_reward + hydration_reward
-                + food_reward + energy_reward - collision_penalty)
-
-    def remember(self, features, reward, next_features, terminal=False):
+    def learn(self, state, action, reward, next_state=None, next_actions=(), terminal=False):
         if not self.adaptive:
-            return
-        experience = (features.copy(), float(reward), next_features.copy(), terminal)
-        self.replay.append(experience)
+            return  # Protection appliquée même si un script appelle learn pendant le tournoi.
+        row = self.q_table.setdefault(state, {})
+        old_value = row.get(action, 0.)
+        future = self.q_table.get(next_state, {})
+        best_next = 0. if terminal else max((future.get(key, 0.) for key in next_actions), default=0.)
+        target = reward + self.gamma * best_next
+        # Formule du Q-learning : Q(s,a) += alpha * [r + gamma*max Q(s',a') - Q(s,a)].
+        row[action] = old_value + self.alpha * (target - old_value)
+        self.updates += 1
         self.online_transitions += 1
 
-        training_due = self.online_transitions % TRAIN_EVERY == 0
-        if terminal or training_due:
-            for _ in range(self.replay_steps):
-                self.learn()
+    def reward(self, previous, current):
+        before, after = previous.self_state, current.self_state
+        ticks = max(1, current.tick - previous.tick)
+        reward = .01 * ticks  # La survie compte, sans écraser les gains de ressources.
+        reward += 10 * (after.health - before.health)
+        reward += 4 * (after.hydration - before.hydration)
+        reward += 3 * (after.satiety - before.satiety)
+        reward += .2 * (after.energy - before.energy)
+        reward += .2 * (self.gamma ** ticks * len(after.inventory) - len(before.inventory))
+        reward += self.exploration_reward  # Encourage à découvrir de nouvelles cellules estimées.
+        reward -= .15 * sum(event.kind is EventKind.COLLISION for event in current.events)
+        if self.last_action.interaction is not None:
+            successes = {EventKind.ITEM_PICKED_UP, EventKind.ITEM_DROPPED, EventKind.ITEM_EQUIPPED,
+                         EventKind.ITEM_USED, EventKind.SHOT_FIRED, EventKind.INTERACTION}
+            if not any(event.kind in successes for event in current.events):
+                reward -= .1  # Une tentative sans effet apporte une pénalité.
+        return reward
 
-    def _training_targets(self, batch):
-        expected_values = np.asarray([experience[1] for experience in batch], dtype=np.float32)
-        next_states = []
-        batch_positions = []
-        for position, experience in enumerate(batch):
-            _, _, next_features, terminal = experience
-            if not terminal:
-                next_states.append(next_features)
-                batch_positions.append(position)
-
-        if not next_states:
-            return expected_values
-
-        all_next_features = np.concatenate(next_states)
-        online_values = self.values(all_next_features)
-        target_values = self.values(all_next_features, target=True)
-        offset = 0
-        for position, next_features in zip(batch_positions, next_states):
-            action_count = len(next_features)
-            action_values = online_values[offset:offset + action_count]
-            best_action = int(np.argmax(action_values))
-            future_value = target_values[offset + best_action]
-            expected_values[position] += self.gamma * future_value
-            offset += action_count
-        return expected_values
-
-    def _gradients(self, inputs, expected_values):
-        input_weights, input_bias, output_weights, output_bias = self.weights
-        hidden_layer = np.tanh(inputs @ input_weights + input_bias)
-        predictions = (hidden_layer @ output_weights + output_bias).ravel()
-
-        errors = np.clip(predictions - expected_values, -1., 1.)
-        output_gradient = (errors / len(inputs))[:, None]
-        activation_derivative = 1 - hidden_layer * hidden_layer
-        hidden_gradient = (output_gradient @ output_weights.T) * activation_derivative
-
-        input_weight_gradient = inputs.T @ hidden_gradient
-        input_bias_gradient = hidden_gradient.sum(axis=0)
-        output_weight_gradient = hidden_layer.T @ output_gradient
-        output_bias_gradient = output_gradient.sum(axis=0)
-        return [
-            input_weight_gradient, input_bias_gradient,
-            output_weight_gradient, output_bias_gradient,
-        ]
-
-    def _update_weights(self, gradients):
-        self.updates += 1
-        for index, gradient in enumerate(gradients):
-            self.moments[index] = .9 * self.moments[index] + .1 * gradient
-            self.variances[index] = .999 * self.variances[index] + .001 * gradient * gradient
-            corrected_moment = self.moments[index] / (1 - .9 ** self.updates)
-            corrected_variance = self.variances[index] / (1 - .999 ** self.updates)
-            adjustment = LEARNING_RATE * corrected_moment / (np.sqrt(corrected_variance) + 1e-8)
-            self.weights[index] -= adjustment
-
-    def learn(self, batch=None):
-        if not self.adaptive:
+    def _update_position(self, observation):
+        self.exploration_reward = 0.
+        if self.previous is None or self.last_action.movement is None:
             return
-        if batch is None:
-            sample_count = min(BATCH_SIZE, len(self.replay))
-            if sample_count == 0:
-                return
-            indices = self.replay_rng.choice(len(self.replay), sample_count, replace=False)
-            batch = [self.replay[int(index)] for index in indices]
-
-        inputs = np.stack([experience[0] for experience in batch])
-        expected_values = self._training_targets(batch)
-        gradients = self._gradients(inputs, expected_values)
-        self._update_weights(gradients)
-
-        if self.updates % TARGET_SYNC_EVERY == 0:
-            self.target = [weights.copy() for weights in self.weights]
+        if any(event.kind is EventKind.COLLISION for event in observation.events):
+            return  # Une collision rend l'estimation du déplacement peu fiable.
+        move = self.last_action.movement
+        angle = observation.self_state.orientation
+        elapsed = max(1, observation.tick - self.last_tick) * .5
+        distance = elapsed * observation.self_state.speed
+        self.position[0] += distance * (cos(angle) * move.forward - sin(angle) * move.right)
+        self.position[1] += distance * (sin(angle) * move.forward + cos(angle) * move.right)
+        cell = tuple(floor(value) for value in self.position)
+        if cell not in self.visits:
+            self.exploration_reward = .02
+        if len(self.visits) >= 2048 and cell not in self.visits:
+            self.visits.pop(next(iter(self.visits)))
+        self.visits[cell] = self.visits.get(cell, 0) + 1
 
     def act(self, observation):
         if observation.tick == self.last_tick:
-            return self.last_action
+            return self.last_action  # Deux appels au même tour ne créent pas deux transitions.
         if observation.tick < self.last_tick:
             self.reset()
-
-        possible_actions = self.candidates(observation)
-        action_features = self.features(observation, possible_actions)
+        self._update_position(observation)
+        state = state_representation(observation)
+        actions = self.candidates(observation)
         if self.previous is not None:
-            previous_observation, previous_features = self.previous
-            self.last_reward = self.reward(previous_observation, observation)
-            self.remember(previous_features, self.last_reward, action_features)
-
-        chosen_index = self.choose(action_features)
-        self.last_action = possible_actions[chosen_index][0]
-        self.previous = (observation, action_features[chosen_index].copy())
+            old_observation, old_state, old_action = self.previous
+            self.last_reward = self.reward(old_observation, observation)
+            self.learn(old_state, old_action, self.last_reward, state, actions)
+        key = self.choose(state, actions)
+        self.last_action = actions[key]
+        self.previous = (observation, state, key)
         self.last_tick = observation.tick
         return self.last_action
 
@@ -365,20 +227,39 @@ class MyAgent:
             return
         self._ended = True
         if self.previous is not None:
-            terminal_reward = -10. if result.reason is EpisodeEndReason.ELIMINATED else 0.
-            no_next_actions = np.empty((0, FEATURE_COUNT), dtype=np.float32)
-            self.remember(self.previous[1], terminal_reward, no_next_actions, terminal=True)
+            observation, state, action = self.previous
+            reward = -10. if result.reason is EpisodeEndReason.ELIMINATED else 0.
+            reward -= .2 * len(observation.self_state.inventory)
+            self.learn(state, action, reward, terminal=True)  # Pas de valeur future après la fin.
         self.episodes += 1
+
+    def _load(self, path):
+        data = json.loads(Path(path).read_text(encoding='utf-8'))
+        if data.get('version') != MODEL_VERSION:
+            raise ValueError('Modèle incompatible : une table Q-learning est nécessaire')
+        table = data.get('q_table')
+        if not isinstance(table, dict):
+            raise ValueError('Table Q invalide')
+        for state, row in table.items():
+            if not isinstance(state, str) or not isinstance(row, dict):
+                raise ValueError('État Q invalide')
+            for action, value in row.items():
+                if not isinstance(action, str) or not isinstance(value, (int, float)):
+                    raise ValueError('Valeur Q invalide')
+                if not -float('inf') < value < float('inf'):
+                    raise ValueError('Valeur Q non finie')
+        self.q_table = table
+        self.episodes = int(data.get('episodes', 0))
+        self.temperature = float(data.get('temperature', 0.))
 
     def save(self, path=MODEL_PATH):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        data = {
-            'version': 4,
-            'actions': list(ACTION_TYPES),
-            'episodes': self.episodes,
-            'weights': [weights.tolist() for weights in self.weights],
-        }
-        temporary_path = path.with_suffix('.tmp')
-        temporary_path.write_text(json.dumps(data, allow_nan=False), encoding='utf-8')
-        temporary_path.replace(path)
+        data = {'version': MODEL_VERSION, 'algorithm': 'tabular_q_learning',
+                'episodes': self.episodes, 'temperature': self.temperature, 'q_table': self.q_table}
+        content = json.dumps(data, ensure_ascii=False, allow_nan=False, separators=(',', ':'))
+        if len(content.encode('utf-8')) > 10_000_000:
+            raise ValueError('La table dépasse la limite de données de 10 Mo')
+        temporary = path.with_suffix('.tmp')
+        temporary.write_text(content, encoding='utf-8')
+        temporary.replace(path)  # Sauvegarde explicite ; aucun fichier écrit automatiquement en tournoi.

@@ -1,10 +1,97 @@
 """Scénarios d'entraînement et de test. Les détails du moteur restent ici."""
 from random import Random
+from math import cos, sin, pi
 from rl_arena.config import EnvironmentConfig
 from rl_arena.environment import TrainingEnvironment
 from rl_arena.bots import HunterBot
 from rl_arena.arena_api import ObjectKind
 from rl_arena.geometry import Rect
+from rl_arena.world import InventoryEntry
+
+
+def make_practice_environment(seed, ticks, agent):
+    rng = Random(seed)
+    config = EnvironmentConfig(max_ticks=ticks)
+    config.generation.fog_probability = 0.
+    config.generation.low_light_probability = 0.
+    env = TrainingEnvironment(config)
+    env.register_agent('student', agent)
+    env.reset(seed=seed)
+    state = env.debug_state()['agents']['student']
+    state.orientation = rng.uniform(-pi, pi)
+    state.health = rng.uniform(.4, 1.)
+    state.energy = rng.uniform(.05, 1.)
+    state.hydration = rng.uniform(.08, .95)
+    state.satiety = rng.uniform(.08, .95)
+    resources = [obj for obj in env.world.objects if obj.kind in {
+        ObjectKind.FOOD, ObjectKind.DRINK, ObjectKind.MEDICINE}]
+    rng.shuffle(resources)
+    inventory_count = rng.randrange(4)
+    for slot, obj in enumerate(resources[:inventory_count]):
+        state.inventory[slot] = InventoryEntry(obj.uid, obj.kind, obj.mass, dict(obj.properties))
+        env.world.objects.remove(obj)
+    for obj in resources[inventory_count:inventory_count + 5]:
+        for _ in range(100):
+            bearing = state.orientation + rng.uniform(-pi, pi)
+            distance = rng.uniform(.4, 4.)
+            x = (state.x + distance * cos(bearing)) % config.map_width
+            y = (state.y + distance * sin(bearing)) % config.map_height
+            if not env._circle_hits_solid(x, y, .3):
+                obj.x, obj.y = x, y
+                break
+    env._last_observations = env._observe_all()
+    return env
+
+
+def make_pursuit_environment(seed, ticks=300, agent=None, difficulty=1., render=False):
+    rng = Random(seed)
+    config = EnvironmentConfig(max_ticks=ticks)
+    config.generation.fog_probability = 0.
+    config.generation.low_light_probability = 0.
+    env = TrainingEnvironment(config, render=render)
+    env.register_agent('student', agent)
+    env.register_agent('hunter', HunterBot(seed=seed + 17))
+    env.reset(seed=seed)
+    if difficulty < .5:
+        env.world.rects.clear()
+        env.world.doors.clear()
+        env.world.areas.clear()
+        env.world.objects.clear()
+    states = env.debug_state()['agents']
+    student, hunter = states['student'], states['hunter']
+    student.energy = rng.uniform(.5, 1.)
+    student.hydration = student.satiety = rng.uniform(.7, 1.)
+    student.orientation = rng.uniform(-pi, pi)
+    placed = False
+    for _ in range(500):
+        x, y = rng.uniform(3, 27), rng.uniform(3, 27)
+        angle, distance = rng.uniform(-pi, pi), rng.uniform(2.5, 6.)
+        hx, hy = x + distance * cos(angle), y + distance * sin(angle)
+        if not (1 < hx < 29 and 1 < hy < 29):
+            continue
+        if env._circle_hits_solid(x, y, .8) or env._circle_hits_solid(hx, hy, .8):
+            continue
+        student.x, student.y = x, y
+        hunter.x, hunter.y = hx, hy
+        hunter.orientation = angle + pi
+        observations = env._observe_all()
+        if any(d.kind is ObjectKind.AGENT for d in observations['hunter'].vision):
+            placed = True
+            break
+    if not placed:
+        raise RuntimeError('Impossible de placer une poursuite visible sans obstacle')
+    launcher = seed % 3 == 0 and difficulty >= .75
+    weapon = 'potato_launcher' if launcher else 'rolling_pin'
+    hunter.inventory[0] = InventoryEntry(200000, ObjectKind.WEAPON,
+        2.2 if launcher else .65, {'label': weapon, 'weapon_type': weapon,
+                                 'damage': .18 if launcher else .12})
+    hunter.equipped_slot = 0
+    if launcher:
+        for slot in range(1, 8):
+            hunter.inventory[slot] = InventoryEntry(200000 + slot, ObjectKind.AMMUNITION,
+                .18, {'label': 'potato', 'ammo_type': 'potato'})
+    env._last_observations = env._observe_all()
+    return env
 
 
 def make_environment(seed, ticks, scenario='standard', agent=None):

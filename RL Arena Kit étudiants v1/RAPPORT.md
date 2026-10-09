@@ -1,88 +1,135 @@
-# Agent adaptatif de survie — version 3
+# Agent Q-learning tabulaire
 
-## Objectif et compatibilité
+## Méthode actuelle
 
-L'objectif est la durée de survie sur une arène inconnue respectant le contrat du kit. L'agent utilise uniquement les perceptions publiques et les types de `rl_arena.arena_api`. Les références d'objets ne sont utilisées comme cibles d'interaction que pendant leur tick de validité. Aucun accès au moteur d'entraînement n'est nécessaire en compétition.
+Le projet est repassé de Double DQN au Q-learning tabulaire. Le fichier
+`student_agent.py` ne contient plus de réseau, de gradients, d'Adam, de réseau
+cible ou de replay buffer. La table Q remplace les poids du réseau.
 
-L'agent peut démarrer avec une table Q vide et apprendre pendant son premier match. Cela ne supprime pas les règles programmées de soin, de navigation et de défense : départ sans checkpoint ne veut pas dire absence de stratégie. Le syllabus communiqué n'impose pas explicitement une remise sans modèle ; le format doit être confirmé auprès du professeur.
+Chaque observation publique devient un état discret : catégories de santé,
+d'énergie, d'hydratation et de satiété, distance de l'adversaire visible le
+plus proche, présence des catégories d'inventaire, objet équipé et collision.
+L'agent ne connaît ni les coordonnées cachées ni la santé de son adversaire.
 
-## Améliorations de V3
+Les actions portent des clés stables indépendantes des références et des
+slots. Pour chaque catégorie visible, la cible la plus proche fournit des
+actions vers elle, à l'opposé, sur les côtés, et des interactions. La distance
+est discrétisée dans la clé. Les déplacements fixes, rotations, repos, tirs
+et interactions avec l'inventaire restent disponibles. L'audition fournit
+également des possibilités de déplacement par rapport au son le plus intense.
+Le choix final consulte uniquement les valeurs Q : aucun seuil de besoin
+n'impose une action et aucune règle ne force la fuite ou l'attaque.
 
-- Les cibles de recherche tiennent compte des ressources déjà transportées et de la capacité de l'inventaire. L'agent cesse de poursuivre une catégorie dont il possède déjà assez d'exemplaires.
-- Un médicament connu comme bandage est réservé aux saignements ; il n'est plus consommé pour soigner simplement une perte de santé, car cela n'avait pas cet effet dans le kit.
-- Quand l'inventaire empêche de ramasser une ressource vitale proche, l'agent peut abandonner une munition ou un objet moins utile. Une exclusion temporaire empêche de reprendre immédiatement l'objet abandonné.
-- La récupération d'énergie utilise une hystérésis : elle commence sous 0,20 et continue jusqu'à 0,75, sauf menace. Cela évite les répétitions de très courts repos avec un déplacement constamment limité par la fatigue.
-- Le coût énergétique est estimé à partir de la vitesse réellement observée, plutôt que de la vitesse demandée que le moteur peut plafonner.
-- La cible de Q-learning exclut les stratégies incompatibles avec les caractéristiques du prochain état discret. Les transitions terminales ne bootstrapent jamais.
+La mise à jour est :
 
-Les anciennes règles de protection restent présentes : soins prioritaires, fuite face à une menace proche, évitement des obstacles, ouverture et exploration des portes, mémoire temporaire des ressources, défense pendant la fuite. Les souvenirs de position restent approximatifs et peuvent dériver pendant les collisions.
-
-## Apprentissage pendant le match
-
-L'observation suivante sert à évaluer l'action précédente. La récompense observable combine survie (+0,025 par tick), gains d'hydratation et de satiété, variation de santé et d'énergie, nouvelles cellules explorées, collisions et ramassages. Une élimination reçoit -12 en fin de match. Une mise à jour directe Q est suivie de quatre rejeux de transitions récentes ; le tampon est limité à 256 expériences. Les taux d'apprentissage sont 0,20 et 0,08, avec un discount de 0,97.
-
-Les neuf caractéristiques discrètes résument santé, énergie, besoins alimentaires, menace, disponibilité de ressources utiles, toucher et dégâts dangereux. La présence de ressources est filtrée selon les besoins et l'inventaire ; le souvenir d'une menace conserve une alerte temporaire. Les actions apprises sont cinq stratégies : exploration, recherche de ressources, fuite, repos et exploration prudente. Leur sélection combine un prior de survie et une correction Q bornée. Les décisions vitales peuvent être imposées par les règles de protection.
-
-Le modèle énergétique est calibré après huit déplacements valides, puis mis à jour progressivement. Cela correspond à quatre secondes simulées si ces huit déplacements se suivent ; les collisions ou le repos peuvent retarder ce calibrage. Ce délai ne garantit pas que l'agent apprenne toute la carte aussi rapidement.
-
-`reset()` réinitialise les souvenirs de carte, l'hystérésis de repos, le tampon de rejeu et les estimations physiques ; il conserve la table Q sur la même instance. Aucun fichier n'est écrit automatiquement pendant un match. `agent.save(path)` peut conserver les connaissances entre processus si le règlement l'autorise.
-
-## Protocole expérimental
-
-Les essais de développement utilisent les graines standard 150000–150007 et stress 140000–140007. Plusieurs variantes ont été comparées : gestion des cibles seule, récupération longue, puis estimation des consommations avec priorités alimentaires modifiées. Cette dernière variante a régressé en développement et a été écartée ; son test unitaire de calibrage alimentaire a été retiré avec le mécanisme. Les tests de protection et d'apprentissage conservés restent exécutés.
-
-La version retenue est entraînée à nouveau sur seize épisodes de 3000 ticks, graines 9000–9015. Le curriculum disperse les ressources, tourne et translate la géométrie, modifie la physiologie et la visibilité. Six graines de validation 50000–50005 sélectionnent le checkpoint. Les clones de validation s'adaptent pendant leur match, puis leur apprentissage est jeté : il ne retourne pas dans le candidat.
-
-Les tests finaux utilisent douze graines standard 160000–160011 et douze graines stress 170000–170011. Ils démarrent **sans checkpoint pour V3**, pour couvrir la remise envisagée par l'étudiant. V2 est comparée à la fois sans modèle (`v2_cold`) et avec son ancien checkpoint (`v2`). Chaque politique rejoue les mêmes arènes avec les mêmes adversaires. La limite est de 3000 ticks, soit 1500 secondes simulées ; une survie atteignant cette limite est censurée. Les petits échantillons ne garantissent pas une performance similaire sur toute arène inconnue.
-
-Le stress cumule une physiologie variable, des ressources et des positions initiales différentes, une géométrie transformée, une visibilité souvent dégradée et un chasseur supplémentaire. Les modifications du monde appartiennent uniquement au dispositif d'expérience ; elles ne sont jamais fournies à la politique comme information cachée.
-
-## Reproduire
-
-Depuis le dossier du kit, avec son venv activé :
-
-```bash
-python -m unittest discover -s tests -v
-python check_student_agent.py
-python train_agent.py --episodes 16 --ticks 3000 --seed 9000 --validation-episodes 6 --validate-every 8 --model artifacts/v3/final/policy.json
-python evaluate_agent.py --episodes 12 --ticks 3000 --seed 160000 --policies cold_adaptive v2_cold v2 --output artifacts/v3/standard
-python evaluate_agent.py --episodes 12 --ticks 3000 --seed 170000 --scenario stress --policies cold_adaptive v2_cold v2 --output artifacts/v3/stress
-python build_submission.py --cold
-python build_submission.py
+```text
+Q(s,a) ← Q(s,a) + 0,15 × [r + 0,98 × max Q(s',a') − Q(s,a)]
 ```
 
-Les données par épisode et temps de décision sont dans les CSV ; les moyennes sont dans les JSON. Les empreintes des sources sont dans `artifacts/v3/source_sha256.txt`. Le rapport et le checkpoint V2 sont archivés dans `artifacts/v2/snapshot`, avec son code dans `previous_agent_v2.py`.
+Le maximum utilise seulement les actions disponibles. Une fin de partie
+supprime la valeur future. L'exploration epsilon-greedy est utilisée pendant
+l'entraînement ; en tournoi, epsilon est désactivé et les égalités sont
+simplement départagées au hasard. Une température fixe peut être testée
+séparément, sans autoriser de mises à jour.
 
-## Remise au professeur
+## Récompense observable
 
-`artifacts/submission_cold.zip` contient une copie autonome de `student_agent.py` qui instancie `MyAgent()` avec `load=False` par défaut, sans fichier de modèle. Ce comportement a été testé même avec un checkpoint invalide placé à côté de l'agent : aucun checkpoint n'est lu et l'agent apprend durant le match. Les règles programmées restent présentes.
+La récompense utilise +0,01 par tick, 10 fois la variation de santé, 4 fois
+celle d'hydratation, 3 fois celle de satiété et 0,2 fois celle d'énergie.
+Chaque collision enlève 0,15 ; une interaction sans événement de réussite
+enlève 0,1. Une cellule locale estimée visitée pour la première fois apporte
+0,02. L'inventaire utilise le potentiel `0,2 × (gamma^durée × après − avant)`,
+avec correction terminale. La mort reçoit une pénalité terminale de 10.
 
-`artifacts/submission.zip` contient aussi le checkpoint V3 sélectionné, pour une remise autorisant l'entraînement préalable. Les anciennes tables V1/V2 ne sont pas réutilisées par V3, car les caractéristiques et les règles ont changé. Sans checkpoint compatible, l'agent utilise ses priors puis apprend en ligne.
+Ces coefficients définissent le retour d'expérience, pas le comportement.
+Les scripts de combat et de défense peuvent ajouter des récompenses hors
+tournoi, décrites dans `COMBAT.md`.
 
-## Limites d'interprétation
+## Entraînement et reproduction
 
-Une amélioration de la survie de V3 ne doit pas être attribuée automatiquement au seul Q-learning : les règles de choix de ressources, d'inventaire et de repos changent aussi. Les évaluations principales portent sur l'agent complet sans checkpoint. Le préentraînement et le calibrage énergétique nécessitent des ablations supplémentaires pour mesurer leur contribution propre.
+```sh
+.venv/bin/python train_curriculum.py --practice-episodes 1200 --arena-episodes 40 --seed 1140000 --model artifacts/q_learning/refined/policy.json
+.venv/bin/python evaluate_agent.py --model artifacts/policy.json --policies frozen dqn_frozen random --episodes 6 --ticks 2400 --seed 1240000 --output artifacts/q_learning/standard
+.venv/bin/python evaluate_agent.py --model artifacts/policy.json --policies frozen dqn_frozen random --episodes 6 --ticks 2400 --seed 1250000 --scenario stress --output artifacts/q_learning/stress
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python check_student_agent.py
+.venv/bin/python build_submission.py
+```
 
-La navigation reste locale, la mémoire est approximative, les seuils programmés peuvent être moins adaptés à une autre physiologie et l'exploration peut encore être fatale. Les connaissances acquises après une élimination ne peuvent aider le même match. Le contrat public, plutôt qu'une connaissance de la carte, assure la portabilité ; il ne garantit pas une victoire.
+Les exercices de ressources utilisent des positions et des besoins variables,
+puis les arènes alternent standard et curriculum. Les graines 50000–50003
+servent à la sélection avec apprentissage désactivé. Les évaluations finales
+utilisent d'autres graines et ne mettent jamais à jour la table.
 
-## Résultats finaux de V3
+## Limites
 
-Sur 24 arènes inédites, V3 démarre sans checkpoint et conserve ses adaptations en ligne :
+La représentation est une approximation : des situations différentes peuvent
+partager le même état et la même clé d'action. Les orientations absolues ne
+sont pas encodées ; les actions relatives à une cible ou un son permettent de
+réutiliser certaines valeurs malgré cette perte d'information. Les états
+inconnus n'héritent pas des valeurs de leurs voisins comme avec un réseau.
+Le nombre de catégories est donc un compromis entre précision et couverture.
 
-| Politique | Standard, 12 graines : survie moyenne en ticks | Stress, 12 graines : survie moyenne en ticks |
+Le code est plus simple à expliquer, mais le Q-learning n'est pas forcément
+plus performant que Double DQN. Les anciens résultats ne s'appliquent pas à
+cette version. L'environnement local n'implémente pas les ressources qui
+réapparaissent chaque tour annoncées pour l'arène finale. Aucun exploit du
+moteur n'est intégré.
+
+## Remise
+
+Le JSON porte la version `q_learning_v1` et contient la table, le nombre
+d'épisodes et la température. Il est incompatible avec les anciens fichiers
+Double DQN, sauvegardés dans `artifacts/double_dqn/snapshot/`.
+La remise reste un fichier Python et des données de moins de 10 Mo.
+L'agent n'apprend pas pendant les combats, n'enregistre aucun fichier
+spontanément et respecte `reset`, `act` et `on_episode_end`.
+
+## Résultats de la version remise
+
+Le checkpoint retenu vient de la campagne affinée : 1200 exercices de 96 tours,
+graines 1140000–1141199, puis 40 arènes de 2400 tours maximum, graines
+1150000–1150039. Il contient 1240 épisodes, 519 états et 13854 valeurs Q.
+Son JSON pèse 652319 octets. La température vaut zéro.
+La validation de sélection sur quatre arènes atteint 1467,5 tours.
+
+La première campagne avait utilisé 2000 exercices et 60 arènes, avec un bonus
+de survie de 0,05 et d'exploration de 0,1. Le nouveau bonus de survie est 0,01
+et celui d'exploration 0,02, afin de réduire leur poids face aux ressources.
+La première campagne atteint 1328,25 tours en validation ; ses résultats sont
+conservés dans `artifacts/q_learning/initial_standard` et `initial_stress`.
+
+Les mesures finales portent sur six graines inédites par scénario, sans mise
+à jour pendant l'évaluation, avec un maximum de 2400 tours.
+
+| Politique | Standard 1240000–1240005 | Stress 1250000–1250005 |
 |---|---:|---:|
-| V3 sans checkpoint | 2119,08 | 1539,50 |
-| V2 sans checkpoint | 2224,00 | 1284,42 |
-| V2 avec son checkpoint | 2224,00 | 1339,42 |
+| Q-learning remis | 1748,17 | 816,17 |
+| Double DQN précédent archivé | 1934,83 | 1150,83 |
+| Bot aléatoire | 1852,67 | 982,17 |
 
-V3 améliore la survie moyenne en stress de **19,9 % face à V2 sans checkpoint**, et de **14,9 % face à V2 avec checkpoint**. En standard, V3 perd **4,7 %** face à V2 : le résultat est un compromis de robustesse, pas une amélioration uniforme.
+Ces petits échantillons montrent une régression de la survie avec le retour
+au Q-learning. La simplification du code ne constitue pas un gain de
+performance. Le temps moyen de décision du Q-learning est d'environ 0,08 ms,
+contre environ 2 ms pour le Double DQN dans ces exécutions.
 
-En donnant le même poids aux deux familles de scénarios, la moyenne V3 est de 1829,29 ticks, contre 1781,71 pour V2 avec checkpoint, soit **+2,7 %**. Ce regroupement donne un poids arbitraire de 50 % à chaque scénario ; la distribution de la compétition réelle est inconnue.
+La moyenne des ramassages standard vaut 42, mais elle est trompeuse : sur la
+graine 1240002, l'agent ramasse 250 fois et dépose 250 fois le même objet.
+Il ne consomme qu'une fois et meurt à 1750 tours. Ce cycle appris est une
+limite de la représentation et de l'apprentissage ; aucun correctif de
+comportement codé en dur n'a été ajouté pour cacher cet échec. Le diagnostic
+est dans `artifacts/q_learning/loop_diagnostic.json`.
 
-V3 garde certains avantages de moyenne avec une dispersion importante : en stress, elle peut encore mourir à 743 ticks, tandis que V2 survit au moins 761 ticks sur cet échantillon. Le gain moyen ne garantit donc pas une meilleure survie dans chaque match. Plusieurs résultats à 3000 ticks correspondent à une élimination exactement à la limite, et non à une survie censurée ; le CSV distingue ces cas avec `reached_limit`.
+Un candidat de défense a aussi été entraîné sur 200 poursuites de 300 tours,
+graines 1130000–1130199. Il survit en moyenne 87,42 tours et termine 2 des
+12 poursuites de validation, mais sa validation en arène reste à 1316,5.
+Un candidat de combat obtient 1316,75 en arène. Le modèle de survie affinée
+est donc retenu selon le critère principal du projet. La comparaison est
+conservée dans `artifacts/q_learning/model_selection.json`.
 
-Les temps de décision moyens observés sont environ 0,054 ms en standard et 0,058 ms en stress, sur cette machine pendant des évaluations parallèles. Ils ne garantissent pas la même latence en compétition. Les **28 tests** passent, y compris la remise sans checkpoint, l'apprentissage en ligne, le filtrage des cibles, la libération de place dans l'inventaire, les bandages et le repos prolongé.
-
-Le checkpoint optionnel livré provient de la campagne finale de seize épisodes ; la validation sélectionnée vaut 2036,33 ticks en moyenne. Les résultats principaux ci-dessus évaluent la version sans checkpoint et ne démontrent pas un gain spécifique du préentraînement Q. Le modèle est optionnel pour la remise sans mémoire.
-
-Les anciennes données V2 et les résultats intermédiaires restent archivés. Les seules mesures de test de la version retenue sont `artifacts/v3/standard` et `artifacts/v3/stress`. Les améliorations observées concernent l'agent complet ; elles ne prouvent pas que le Q-learning seul explique les gains.
+Le candidat de combat séparé a été entraîné sur 200 duels, graines
+1160000–1160199, à partir du checkpoint intermédiaire de la campagne affinée
+après 10 arènes. Il remporte 2 des 12 duels de validation et 1 des 24 duels
+supplémentaires 1260000–1260023, contre 0 pour l'ancienne V5 sur ces 24 duels.
+Il meurt dans 20 duels contre 18 pour V5 : cela ne démontre pas une meilleure
+survie. Ce candidat n'est pas la table chargée par défaut pour la remise.
